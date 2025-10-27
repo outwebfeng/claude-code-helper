@@ -93,13 +93,21 @@ EOF
         if [ -z "$MESSAGE_ID" ]; then
             # Show recent messages (default: 20)
             LIMIT="${3:-20}"
-            echo -e "${BLUE}=== 最近 $LIMIT 条消息 ===${NC}"
+            echo -e "${BLUE}=== 最近 $LIMIT 条消息（含会话信息）===${NC}"
             sqlite3 "$DB_PATH" -column -header << EOF
-.width 5 20 70
+.width 3 25 12 8 10 60
 SELECT
     m.id as "ID",
-    strftime('%Y-%m-%d %H:%M', m.timestamp) as "时间",
-    substr(m.content, 1, 70) as "消息"
+    s.project_name as "项目名称",
+    strftime('%m-%d %H:%M', s.start_time) as "会话开始",
+    CASE
+        WHEN s.duration IS NULL THEN '-'
+        WHEN s.duration < 60 THEN s.duration || 's'
+        WHEN s.duration < 3600 THEN (s.duration/60) || 'm'
+        ELSE (s.duration/3600) || 'h' || ((s.duration%3600)/60) || 'm'
+    END as "时长",
+    s.status as "状态",
+    substr(m.content, 1, 60) as "消息内容"
 FROM messages m
 JOIN sessions s ON m.session_id = s.id
 ORDER BY m.timestamp DESC
