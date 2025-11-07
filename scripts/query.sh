@@ -52,14 +52,14 @@ FROM sessions
 WHERE date(start_time) = date('now', 'localtime') AND status='completed'
 UNION ALL
 SELECT
-    '今日总时长(小时)', ROUND(SUM(duration)/3600.0, 2)
+    '今日会话总时长(小时)', ROUND(SUM(duration)/3600.0, 2)
 FROM sessions
 WHERE date(start_time) = date('now', 'localtime')
 UNION ALL
 SELECT
-    '平均时长(分钟)', ROUND(AVG(duration)/60.0, 1)
+    '今日单次对话平均(分钟)', ROUND(AVG(last_interaction_duration)/60.0, 1)
 FROM sessions
-WHERE date(start_time) = date('now', 'localtime') AND status='completed'
+WHERE date(start_time) = date('now', 'localtime') AND status='completed' AND last_interaction_duration IS NOT NULL
 UNION ALL
 SELECT
     '本周总会话', COUNT(*)
@@ -67,9 +67,14 @@ FROM sessions
 WHERE date(start_time) >= date('now', 'localtime', 'weekday 0', '-7 days')
 UNION ALL
 SELECT
-    '本周总时长(小时)', ROUND(SUM(duration)/3600.0, 2)
+    '本周会话总时长(小时)', ROUND(SUM(duration)/3600.0, 2)
 FROM sessions
-WHERE date(start_time) >= date('now', 'localtime', 'weekday 0', '-7 days');
+WHERE date(start_time) >= date('now', 'localtime', 'weekday 0', '-7 days')
+UNION ALL
+SELECT
+    '本周单次对话平均(分钟)', ROUND(AVG(last_interaction_duration)/60.0, 1)
+FROM sessions
+WHERE date(start_time) >= date('now', 'localtime', 'weekday 0', '-7 days') AND status='completed' AND last_interaction_duration IS NOT NULL;
 EOF
         ;;
 
@@ -93,26 +98,36 @@ EOF
         if [ -z "$MESSAGE_ID" ]; then
             # Show recent messages (default: 20)
             LIMIT="${3:-20}"
-            echo -e "${BLUE}=== 最近 $LIMIT 条消息（含会话信息）===${NC}"
-            sqlite3 "$DB_PATH" -column -header << EOF
-.width 3 25 12 8 10 60
+            echo -e "${BLUE}=== 最近 $LIMIT 条消息（按会话分组）===${NC}"
+            # 使用简洁的列表格式,单行显示
+            {
+                echo "ID|会话|项目|时间|耗时|状态|消息内容"
+                sqlite3 "$DB_PATH" << EOF
 SELECT
-    m.id as "ID",
-    s.project_name as "项目名称",
-    strftime('%m-%d %H:%M', s.start_time) as "会话开始",
+    m.id || '|' ||
+    m.session_id || '|' ||
+    substr(s.project_name, 1, 18) || '|' ||
+    strftime('%d %H:%M', m.timestamp) || '|' ||
     CASE
-        WHEN s.duration IS NULL THEN '-'
-        WHEN s.duration < 60 THEN s.duration || 's'
-        WHEN s.duration < 3600 THEN (s.duration/60) || 'm'
-        ELSE (s.duration/3600) || 'h' || ((s.duration%3600)/60) || 'm'
-    END as "时长",
-    s.status as "状态",
-    substr(m.content, 1, 60) as "消息内容"
+        WHEN m.interaction_duration IS NULL THEN '-'
+        WHEN m.interaction_duration = 0 THEN '首次'
+        WHEN m.interaction_duration < 60 THEN m.interaction_duration || 's'
+        WHEN m.interaction_duration < 3600 THEN (m.interaction_duration/60) || 'm' || (m.interaction_duration%60) || 's'
+        ELSE (m.interaction_duration/3600) || 'h' || ((m.interaction_duration%3600)/60) || 'm'
+    END || '|' ||
+    CASE
+        WHEN s.status = 'completed' THEN '完成'
+        WHEN s.status = 'running' THEN '运行'
+        WHEN s.status = 'terminated' THEN '终止'
+        ELSE s.status
+    END || '|' ||
+    replace(replace(substr(m.content, 1, 50), char(10), ' '), char(13), ' ') as result
 FROM messages m
 JOIN sessions s ON m.session_id = s.id
 ORDER BY m.timestamp DESC
 LIMIT $LIMIT;
 EOF
+            } | column -t -s '|'
         else
             # Show specific message by ID (full content)
             echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -124,15 +139,31 @@ EOF
             MSG_CONTENT=$(sqlite3 "$DB_PATH" "SELECT m.content FROM messages m WHERE m.id = $MESSAGE_ID;")
             SESSION_ID=$(sqlite3 "$DB_PATH" "SELECT m.session_id FROM messages m WHERE m.id = $MESSAGE_ID;")
             PROJECT=$(sqlite3 "$DB_PATH" "SELECT s.project_name FROM messages m JOIN sessions s ON m.session_id = s.id WHERE m.id = $MESSAGE_ID;")
+            PROJECT_PATH=$(sqlite3 "$DB_PATH" "SELECT COALESCE(m.project_path, s.project_path) FROM messages m JOIN sessions s ON m.session_id = s.id WHERE m.id = $MESSAGE_ID;")
+            DURATION=$(sqlite3 "$DB_PATH" "SELECT m.interaction_duration FROM messages m WHERE m.id = $MESSAGE_ID;")
             STATUS=$(sqlite3 "$DB_PATH" "SELECT s.status FROM messages m JOIN sessions s ON m.session_id = s.id WHERE m.id = $MESSAGE_ID;")
 
             if [ -z "$MSG_TIME" ]; then
                 echo -e "${RED}❌ 未找到消息 ID: $MESSAGE_ID${NC}"
             else
+                # Format duration
+                if [ -n "$DURATION" ] && [ "$DURATION" != "" ]; then
+                    if [ "$DURATION" -lt 60 ]; then
+                        DURATION_STR="${DURATION}秒"
+                    elif [ "$DURATION" -lt 3600 ]; then
+                        DURATION_STR="$((DURATION/60))分$((DURATION%60))秒"
+                    else
+                        DURATION_STR="$((DURATION/3600))小时$(((DURATION%3600)/60))分"
+                    fi
+                else
+                    DURATION_STR="未知"
+                fi
 
                 echo ""
                 echo -e "${GREEN}⏰ 时间：${NC}$MSG_TIME"
                 echo -e "${GREEN}📂 项目：${NC}$PROJECT"
+                echo -e "${GREEN}📁 路径：${NC}$PROJECT_PATH"
+                echo -e "${GREEN}⏱️  持续时长：${NC}$DURATION_STR"
                 echo -e "${GREEN}🔗 会话ID：${NC}$SESSION_ID ${YELLOW}(状态: $STATUS)${NC}"
                 echo ""
                 echo -e "${YELLOW}💬 完整内容：${NC}"

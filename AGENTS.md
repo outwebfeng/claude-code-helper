@@ -1,35 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Core automation scripts (`install.sh`, `uninstall.sh`, `diagnose.sh`, `test.sh`) live at the repo root.
-- Operational logic resides in `scripts/` (`init.sh`, `record.sh`, `cleanup.sh`, `query.sh`). Treat these as the single source for hook behaviour.
-- Docs and runbooks (e.g., `docs/INSTALL.md`, `docs/DEBUG_GUIDE.md`, `CLAUDE.md`) explain installation, debugging, and operating procedures.
-- `backups/` stores the full-featured script snapshots; copy them back into `scripts/` when you are done with the debug-only build.
-- Scenario-specific test fixtures (`test_hooks*.sh`, `test_notify.sh`) and status dashboards (`STATUS.md`) remain in the top level for quick access.
+This repository packages the Claude Code Monitor automation. Root脚本如 `install.sh`、`uninstall.sh`、`test.sh` 负责安装、卸载与回归检查。核心 hook 逻辑位于 `scripts/`（`init.sh` 建库、`record.sh` 写入会话、`query.sh` 输出报表）。贡献者文档存放在 `docs/` 及 `CLAUDE.md`。运行时资产位于 `~/.claude/claude-code-helper/`，日志写入 `logs/`，数据库 `monitor.db` 保存在父目录 `~/.claude/`。全局 hook 通过用户级 `~/.claude/settings.json` 下发，安装时会扫描 `CLAUDE_HELPER_SCAN_ROOTS`（默认 `~/Documents`）内的 `.claude/settings*.json` 自动补齐。
 
 ## Build, Test, and Development Commands
-- `bash scripts/init.sh`: Prepare the `~/.claude` workspace and logging layout.
-- `bash install.sh [--with-daemon]`: Install hooks and optional LaunchAgent refresher.
-- `bash test_hooks_simple.sh`: Minimal hook smoke-test; confirms trigger wiring.
-- `bash test.sh`: Comprehensive regression suite; spins up `test_monitor.db`.
-- `bash diagnose.sh`: Environment check covering permissions, SQLite, and LaunchAgent state.
-- `tail -f ~/.claude/logs/hook_debug.log`: Observe live hook events while iterating.
+Run `bash scripts/init.sh` to bootstrap a local SQLite schema when iterating outside the installer. Run `./install.sh [--with-daemon]` 复制脚本、更新 `~/.claude/settings.json` 并批量修补 `CLAUDE_HELPER_SCAN_ROOTS` 路径下的 `.claude/settings*.json`。使用 `./uninstall.sh` 可备份数据库、移除用户级/工程级 hook，并清理历史扫描记录。`./test.sh` 会初始化 `test_monitor.db` 并验证表、索引、触发器。调试时可通过 `tail -f ~/.claude/claude-code-helper/logs/monitor.log` 观察事件。
 
 ## Coding Style & Naming Conventions
-- Target Bash 3.2; keep shebangs as `#!/bin/bash` and enable `set -e` (layer `-u`/`-o pipefail` when stable).
-- Prefer four-space indentation inside blocks, uppercase for constant-like vars (`CLAUDE_DIR`), and snake_case for helpers (`setup_test_env`).
-- Quote variable expansions, use `[[ ... ]]` for conditionals, and group reusable logic near the top. Run `shellcheck` before committing complex changes.
+All scripts target Bash 3.2 with `#!/bin/bash` shebangs and `set -e`; escalate to `set -u -o pipefail` only after verifying behaviour. Indent blocks with four spaces, reserve uppercase for constant-style variables (`CLAUDE_DIR`), and prefer snake_case helpers (`setup_test_env`). Use `[[ … ]]` conditionals, quote expansions, and keep reusable helpers near the top. Run `shellcheck scripts/*.sh install.sh uninstall.sh` before submitting substantial changes.
 
 ## Testing Guidelines
-- Tests assume a writable `~/.claude` tree and `sqlite3` on `PATH`.
-- Follow the `test_*.sh` naming pattern; make new scripts idempotent.
-- Record manual verification (e.g., LaunchAgent behaviour) in `STATUS.md` or an appropriate doc entry.
+Testing relies on `sqlite3` being available and a writable `~/.claude` tree. Add new test harnesses as `test_*.sh` scripts that reset their fixtures and leave `monitor.db` intact. Document any manual verification (e.g., LaunchAgent behaviour or notification flows) in `STATUS.md` or an appropriate doc in `docs/`.
 
 ## Commit & Pull Request Guidelines
-- Use concise, imperative commit subjects (`Fix daemon cleanup race`).
-- PRs should call out touched scripts/docs, manual test evidence, and relevant log excerpts or screenshots.
-- Cross-link related docs (e.g., `docs/DEBUG_GUIDE.md`) and confirm changes preserve `~/.claude` paths and permissions.
+Write short, imperative commit subjects (`Add record event guard`). In PRs, summarize affected scripts or docs, call out manual test evidence, and link relevant issues or logs. Cross-reference supporting guides (for example `docs/PROJECT_SUMMARY.md` or `CLAUDE.md`) so the next maintainer can trace rationale. Confirm that hooks still target the `~/.claude` namespace and that database migrations include forward/backward instructions.
 
-## Configuration & Safety Notes
-- Repo scripts edit `~/.claude/settings.json`, `monitor.db`, and LaunchAgent entries—test in a sandboxed profile before shipping.
-- Back up `backups/` artifacts prior to overwriting, and restore production-ready scripts with `cp backups/scripts_backup_*/\*.sh scripts/` when graduating from debug mode.
+## Security & Configuration Tips
+Repository 脚本会写入 `~/.claude/settings.json`、`CLAUDE_HELPER_SCAN_ROOTS` 中的 `.claude/settings*.json`、`monitor.db` 以及可选 LaunchAgent。危险操作请先在隔离环境验证，并在覆盖前备份 `~/.claude/claude-code-helper/backups/`。从备份恢复脚本时注意保留可执行权限。

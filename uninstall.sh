@@ -6,7 +6,6 @@ set -e
 
 CLAUDE_DIR="$HOME/.claude"
 APP_DIR="$HOME/.claude/claude-code-helper"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.claude.monitor.plist"
 
 # Colors
 RED='\033[0;31m'
@@ -20,14 +19,6 @@ echo -e "${BLUE}Claude Code Monitor - Uninstallation${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-# Stop and unload LaunchAgent
-if [ -f "$PLIST_PATH" ]; then
-    echo -e "${YELLOW}Stopping LaunchAgent daemon...${NC}"
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    rm "$PLIST_PATH"
-    echo -e "${GREEN}✓ LaunchAgent removed${NC}"
-fi
-
 # Remove Claude Code Hooks configuration
 echo ""
 echo -e "${YELLOW}Removing Claude Code Hooks configuration...${NC}"
@@ -35,85 +26,106 @@ echo -e "${YELLOW}Removing Claude Code Hooks configuration...${NC}"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 
 if [ -f "$CLAUDE_SETTINGS" ]; then
-    # Check if hooks exist
-    if grep -q '"hooks"' "$CLAUDE_SETTINGS" 2>/dev/null; then
-        # Backup current settings
-        cp "$CLAUDE_SETTINGS" "${CLAUDE_SETTINGS}.uninstall_backup"
-        echo -e "${BLUE}  Backed up settings to ${CLAUDE_SETTINGS}.uninstall_backup${NC}"
+    cp "$CLAUDE_SETTINGS" "${CLAUDE_SETTINGS}.uninstall_backup"
+    echo -e "${BLUE}  Backed up settings to ${CLAUDE_SETTINGS}.uninstall_backup${NC}"
 
-        # Use Python to remove hooks
-        SETTINGS_FILE="$CLAUDE_SETTINGS" python3 << 'EOF'
+    SETTINGS_FILE="$CLAUDE_SETTINGS" APP_DIR="$APP_DIR" python3 << 'EOF'
 import json
-import sys
 import os
+import sys
+from pathlib import Path
 
 settings_file = os.environ['SETTINGS_FILE']
+app_dir = os.environ['APP_DIR']
 
 try:
-    # Read current settings
-    with open(settings_file, 'r') as f:
+    with open(settings_file, "r", encoding="utf-8") as f:
         settings = json.load(f)
+except Exception:
+    sys.exit(0)
 
-    # Remove hooks if they exist
-    if 'hooks' in settings:
-        # Check if hooks contain our monitor scripts
-        hooks = settings.get('hooks', {})
-        has_monitor_hooks = False
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
 
-        for hook_type in ['SessionStart', 'Stop', 'Notification']:
-            if hook_type in hooks:
-                for hook_config in hooks[hook_type]:
-                    for hook in hook_config.get('hooks', []):
-                        if 'record.sh' in hook.get('command', ''):
-                            has_monitor_hooks = True
-                            break
+removed = False
 
-        if has_monitor_hooks:
-            del settings['hooks']
+hook_commands = {
+    "SessionStart": {f"{app_dir}/scripts/record.sh start"},
+    "UserPromptSubmit": {f"{app_dir}/scripts/record.sh user_prompt"},
+    "Stop": {f"{app_dir}/scripts/record.sh stop"},
+    "Notification": {f"{app_dir}/scripts/record.sh notification"},
+}
 
-            # Write back
-            with open(settings_file, 'w') as f:
-                json.dump(settings, f, indent=2)
-                f.write('\n')
+for event in list(hooks.keys()):
+    entries = hooks.get(event)
+    if not isinstance(entries, list):
+        continue
 
-            print("✓ Hooks removed from settings.json")
-        else:
-            print("ℹ️  No monitor hooks found in settings.json")
+    new_entries = []
+    for entry in entries:
+        hooks_list = entry.get("hooks")
+        if not isinstance(hooks_list, list):
+            new_entries.append(entry)
+            continue
+
+        filtered = [
+            hook
+            for hook in hooks_list
+            if not (
+                hook.get("type") == "command"
+                and isinstance(hook.get("command"), str)
+                and hook["command"] in hook_commands.get(event, set())
+            )
+        ]
+
+        if len(filtered) != len(hooks_list):
+            removed = True
+
+        if filtered:
+            entry = dict(entry)
+            entry["hooks"] = filtered
+            new_entries.append(entry)
+
+    if new_entries:
+        hooks[event] = new_entries
     else:
-        print("ℹ️  No hooks configuration found")
+        if entries:
+            removed = True
+        hooks.pop(event, None)
 
-except Exception as e:
-    print(f"⚠️  Error: {e}")
-    sys.exit(1)
+if removed:
+    if hooks:
+        settings["hooks"] = hooks
+    else:
+        settings.pop("hooks", None)
+
+    with open(settings_file, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+    print("✓ settings.json 中的监控命令已移除")
+else:
+    print("ℹ️  settings.json 中未发现监控命令")
 EOF
-
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✓ Claude Code Hooks removed from $CLAUDE_SETTINGS${NC}"
-        else
-            echo -e "${YELLOW}⚠️  Could not automatically remove hooks${NC}"
-            echo -e "${YELLOW}  Please manually check: $CLAUDE_SETTINGS${NC}"
-            echo -e "${YELLOW}  Backup available at: ${CLAUDE_SETTINGS}.uninstall_backup${NC}"
-        fi
-    else
-        echo -e "${BLUE}  No hooks configuration found in settings.json${NC}"
-    fi
 else
     echo -e "${BLUE}  Settings file not found${NC}"
 fi
 
-# Backup database before deletion
+# 清理遗留的插件目录（兼容旧版本）
+if [ -d "$HOME/.claude/plugins/claude-code-helper" ]; then
+    rm -rf "$HOME/.claude/plugins/claude-code-helper"
+    echo -e "${BLUE}  Removed legacy plugin directory ~/.claude/plugins/claude-code-helper${NC}"
+fi
+
+# Keep database (data is valuable now)
 DB_PATH="$CLAUDE_DIR/monitor.db"
 echo ""
-echo -e "${YELLOW}Backing up database...${NC}"
+echo -e "${YELLOW}Checking database...${NC}"
 
 if [ -f "$DB_PATH" ]; then
-    BACKUP_FILE="$CLAUDE_DIR/monitor.db.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$DB_PATH" "$BACKUP_FILE"
-    echo -e "${GREEN}✓ Database backed up to: $BACKUP_FILE${NC}"
-
-    # Remove database
-    rm "$DB_PATH"
-    echo -e "${GREEN}✓ Database removed${NC}"
+    echo -e "${GREEN}✓ Database preserved: $DB_PATH${NC}"
+    echo -e "${BLUE}  ℹ️  To remove database, use: claude-flush-db${NC}"
 else
     echo -e "${BLUE}ℹ️  Database file not found${NC}"
 fi
@@ -157,22 +169,18 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo ""
 
 echo -e "${BLUE}What was removed:${NC}"
-echo -e "  ✓ LaunchAgent daemon (if installed)"
 echo -e "  ✓ Claude Code Hooks configuration (from settings.json)"
 echo -e "  ✓ Shell aliases"
-echo -e "  ✓ Database: $DB_PATH"
 echo -e "  ✓ Application directory: $APP_DIR/"
 echo ""
 
 echo -e "${BLUE}Preserved:${NC}"
 echo -e "  ✓ ~/.claude directory (Claude Code official directory)"
 echo -e "  ✓ settings.json (hooks removed, other settings intact)"
+echo -e "  ✓ Database: $DB_PATH (contains valuable session history)"
 echo ""
 
 echo -e "${BLUE}Backup files created:${NC}"
-if [ -f "$BACKUP_FILE" ]; then
-    echo -e "  Database: $BACKUP_FILE"
-fi
 if [ -f "${CLAUDE_SETTINGS}.uninstall_backup" ]; then
     echo -e "  Settings: ${CLAUDE_SETTINGS}.uninstall_backup"
 fi
@@ -181,6 +189,10 @@ for RC_FILE in "$HOME/.zshrc" "$HOME/.bashrc"; do
         echo -e "  Shell: ${RC_FILE}.backup"
     fi
 done
+echo ""
+
+echo -e "${YELLOW}Note:${NC}"
+echo -e "  Database was preserved. To remove it, run: ${BLUE}claude-flush-db${NC}"
 echo ""
 
 echo -e "${YELLOW}Next steps:${NC}"

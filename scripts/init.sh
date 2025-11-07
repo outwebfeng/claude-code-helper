@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     end_time DATETIME,
     duration INTEGER,
     last_prompt_time DATETIME,
+    last_interaction_duration INTEGER,
     status TEXT DEFAULT 'running' CHECK(status IN ('running', 'completed', 'terminated')),
     project_name TEXT,
     project_path TEXT,
@@ -66,6 +67,8 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id INTEGER NOT NULL,
     message_type TEXT DEFAULT 'user' CHECK(message_type IN ('user', 'system', 'error')),
     content TEXT NOT NULL,
+    interaction_duration INTEGER,
+    project_path TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -123,6 +126,71 @@ FROM sessions
 WHERE date(start_time) = date('now', 'localtime');
 
 EOF
+
+# 数据库迁移:为现有数据库添加新字段
+echo ""
+echo "🔄 检查数据库迁移..."
+
+# 检查 sessions.last_interaction_duration 字段是否存在
+COLUMN_EXISTS=$(sqlite3 "$DB_PATH" "PRAGMA table_info(sessions);" | grep -c "last_interaction_duration" || echo "0")
+
+if [ "$COLUMN_EXISTS" = "0" ]; then
+    echo "  添加 sessions.last_interaction_duration 字段..."
+    sqlite3 "$DB_PATH" << 'MIGRATION_EOF'
+ALTER TABLE sessions ADD COLUMN last_interaction_duration INTEGER;
+MIGRATION_EOF
+    echo "  ✅ 字段添加成功"
+else
+    echo "  ℹ️  sessions.last_interaction_duration 字段已存在"
+fi
+
+# 检查 messages.interaction_duration 字段是否存在
+COLUMN_EXISTS=$(sqlite3 "$DB_PATH" "PRAGMA table_info(messages);" | grep -c "interaction_duration" || echo "0")
+
+if [ "$COLUMN_EXISTS" = "0" ]; then
+    echo "  添加 messages.interaction_duration 字段..."
+    sqlite3 "$DB_PATH" << 'MIGRATION_EOF'
+ALTER TABLE messages ADD COLUMN interaction_duration INTEGER DEFAULT NULL;
+
+-- 为现有消息计算持续时长
+UPDATE messages SET interaction_duration = (
+    SELECT CAST((julianday(m1.timestamp) - julianday(
+        COALESCE(
+            (SELECT MAX(m2.timestamp)
+             FROM messages m2
+             WHERE m2.session_id = m1.session_id
+             AND m2.timestamp < m1.timestamp),
+            (SELECT start_time FROM sessions WHERE id = m1.session_id)
+        )
+    )) * 86400 AS INTEGER)
+    FROM messages m1
+    WHERE m1.id = messages.id
+);
+MIGRATION_EOF
+    echo "  ✅ 字段添加成功并计算了现有消息的持续时长"
+else
+    echo "  ℹ️  messages.interaction_duration 字段已存在"
+fi
+
+# 检查 messages.project_path 字段是否存在
+COLUMN_EXISTS=$(sqlite3 "$DB_PATH" "PRAGMA table_info(messages);" | grep -c "project_path" || echo "0")
+
+if [ "$COLUMN_EXISTS" = "0" ]; then
+    echo "  添加 messages.project_path 字段..."
+    sqlite3 "$DB_PATH" << 'MIGRATION_EOF'
+ALTER TABLE messages ADD COLUMN project_path TEXT DEFAULT NULL;
+
+-- 为现有消息填充项目路径(从关联的 session 获取)
+UPDATE messages SET project_path = (
+    SELECT s.project_path
+    FROM sessions s
+    WHERE s.id = messages.session_id
+);
+MIGRATION_EOF
+    echo "  ✅ 字段添加成功并填充了现有消息的项目路径"
+else
+    echo "  ℹ️  messages.project_path 字段已存在"
+fi
 
 # 验证数据库创建
 TABLE_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';")

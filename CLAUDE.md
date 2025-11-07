@@ -18,28 +18,24 @@ Claude Code Helper is a lightweight monitoring tool for Claude Code sessions tha
 **Core Features:**
 - Session lifecycle tracking (start/stop/duration)
 - User message recording for history
-- macOS notification alerts on completion
+- macOS desktop notifications via terminal-notifier
 - SQLite-based data persistence
 - Statistical analysis and reporting
-- Automatic cleanup of abnormal sessions (daemon-based)
+- User-level hooks configuration (global for all projects)
 
 ## Architecture Overview
 
-The system uses a **4-layer architecture** with event-driven processing:
+The system uses a **3-layer architecture** with event-driven processing:
 
-1. **Hook Layer**: Claude Code hooks intercept lifecycle events (SessionStart/Stop/Notification/Error) and trigger shell scripts with JSON payloads via stdin
-2. **Script Layer**: Bash scripts (`record.sh`, `cleanup.sh`, `query.sh`) handle events and data operations
+1. **Hook Layer**: Claude Code hooks intercept lifecycle events (SessionStart/Stop/UserPromptSubmit/Notification) and trigger shell scripts with JSON payloads via stdin
+2. **Script Layer**: Bash scripts (`record.sh`, `query.sh`) handle events and data operations
 3. **Data Layer**: SQLite database (`~/.claude/monitor.db`) with 4 tables, 5 indexes, 2 views, and triggers for data integrity
-4. **Notification Layer**: macOS native notifications via `osascript` (dialog-based for reliability) or `terminal-notifier`
+4. **Notification Layer**: Desktop notifications via `terminal-notifier` (required dependency)
 
 ### Data Flow
 
 ```
-Claude Code Event → Hook Trigger → record.sh (stdin JSON) → SQLite Write → Notification
-                                                                    ↓
-                                                           Daemon (cleanup.sh)
-                                                                    ↓
-                                                           Mark Terminated Sessions
+Claude Code Event → Hook Trigger → record.sh (stdin JSON) → SQLite Write → terminal-notifier
 ```
 
 ### Database Schema
@@ -61,18 +57,21 @@ Claude Code Event → Hook Trigger → record.sh (stdin JSON) → SQLite Write �
 ### Installation & Setup
 
 ```bash
-# Standard installation (copies scripts, initializes DB, configures hooks)
+# Installation (copies scripts, initializes DB, configures user-level hooks)
 ./install.sh
 
-# Install with daemon for automatic cleanup (recommended)
-./install.sh --with-daemon
-
-# Uninstall (prompts to keep data)
+# Uninstall (removes user-level hooks, backs up data)
 ./uninstall.sh
 
 # Run tests (database integrity, script permissions, session lifecycle)
 ./test.sh
 ```
+
+**Requirements:**
+- macOS 10.15+
+- terminal-notifier (automatically installed if not present)
+- SQLite 3.x (pre-installed on macOS)
+- Python 3.x (for hooks configuration)
 
 ### Common Development Tasks
 
@@ -80,8 +79,9 @@ Claude Code Event → Hook Trigger → record.sh (stdin JSON) → SQLite Write �
 # Query operations (use aliases after installation)
 claude-stats                    # View statistics
 claude-today                    # View today's sessions
+claude-msg [limit]              # View recent messages (default: 20, shows by session)
+claude-msg <message_id>         # View specific message details
 claude-query active             # View running sessions
-claude-query messages [id]      # View messages for session
 claude-query export csv         # Export data as CSV
 claude-query clean 30           # Clean data older than 30 days
 
@@ -90,20 +90,14 @@ sqlite3 ~/.claude/monitor.db
 # Example queries:
 #   SELECT * FROM active_sessions;
 #   SELECT * FROM today_stats;
-#   SELECT * FROM sessions WHERE status='terminated';
+#   SELECT * FROM sessions WHERE status='completed';
 
 # Manual hook testing (for debugging)
-echo '{"message":"test"}' | ~/.claude/scripts/record.sh start
-~/.claude/scripts/record.sh stop
-
-# Daemon management
-launchctl load ~/Library/LaunchAgents/com.claude.monitor.plist
-launchctl unload ~/Library/LaunchAgents/com.claude.monitor.plist
-launchctl list | grep claude.monitor
+echo '{"message":"test"}' | ~/.claude/claude-code-helper/scripts/record.sh start
+~/.claude/claude-code-helper/scripts/record.sh stop
 
 # View logs
-tail -f ~/.claude/logs/monitor.log
-tail -f ~/.claude/logs/daemon.log
+tail -f ~/.claude/claude-code-helper/logs/monitor.log
 ```
 
 ### Testing & Debugging
@@ -143,10 +137,13 @@ sqlite3 ~/.claude/monitor.db "PRAGMA integrity_check;"
 **Hook Processing Flow:**
 1. `record.sh` reads JSON from stdin using `cat` (if stdin is not a terminal)
 2. Extracts fields using `jq` (message, session_id, source)
-3. Finds or creates running session in database (last running session by DESC id)
+3. Finds or creates running session in database:
+   - First tries to match by `session_uuid` from hook payload
+   - Falls back to finding by **PPID** (parent process ID) - hooks run in child processes but share the same Claude Code parent
+   - Verifies the process is still alive before reusing session
 4. Performs SQL operations (insert/update) with escaped strings (`'` → `''`)
 5. For Stop event: triggers notification with formatted stats
-6. Logs all operations to `~/.claude/logs/monitor.log` with timestamps
+6. Logs all operations to `~/.claude/claude-code-helper/logs/monitor.log` with timestamps
 
 ### Session State Machine
 
@@ -159,9 +156,10 @@ sqlite3 ~/.claude/monitor.db "PRAGMA integrity_check;"
 ```
 
 **Key Behaviors:**
-- **One active session per terminal**: Uses latest `status='running'` record
+- **One active session per Claude Code instance**: Matches by PPID (parent process) instead of `$$` (hook subprocess)
 - **Session UUID**: Generated as `$(date +%s)-$$-$RANDOM` (timestamp-pid-random)
-- **PID tracking**: Used by cleanup script to detect orphaned sessions via `kill -0 $pid`
+- **PID tracking**: Stores `$PPID` (Claude Code main process), used by cleanup script to detect orphaned sessions via `kill -0 $pid`
+- **Dead session detection**: Before reusing a session, verifies the process is alive; marks dead sessions as `terminated`
 - **24-hour timeout**: Sessions running >24h automatically marked terminated
 
 ### SQL Injection Protection
@@ -180,18 +178,20 @@ EOF
 
 ### Notification Strategy
 
-Uses `osascript display dialog` instead of `display notification` for reliability:
-- **Dialog advantages**: Guaranteed to appear, user-dismissible, survives sleep/wake
-- **5-second auto-dismiss**: `giving up after 5` parameter
-- **Format:** "项目: {name} / 耗时: {duration} / 今日: 第{N}次, 平均{avg}"
+Uses `terminal-notifier` for reliable desktop notifications:
+- **Advantages**: Native macOS notifications, persistent, actionable
+- **Format:** Title + multi-line message with project, duration, and today's stats
+- **Sound:** Customizable per notification type (e.g., "Glass" for completion)
 - **Duration formatting:** <60s: "Ns", <3600s: "Nm Ns", else: "Nh Nm"
+- **Installation:** Required dependency, automatically installed via Homebrew if missing
 
 ### Database Operations
 
 **Session Creation (SessionStart):**
 ```sql
 INSERT INTO sessions (session_uuid, start_time, status, project_name, project_path, pid, terminal_session)
-VALUES ('uuid', datetime('now'), 'running', 'name', 'path', pid, '$TERM_SESSION_ID');
+VALUES ('uuid', datetime('now'), 'running', 'name', 'path', $PPID, '$TERM_SESSION_ID');
+-- Note: Uses $PPID (parent process ID) not $$ (hook subprocess ID)
 ```
 
 **Session Completion (Stop):**
@@ -211,14 +211,12 @@ SELECT date('now', 'localtime'), COUNT(*), SUM(duration), AVG(duration),
 FROM sessions WHERE date(start_time) = date('now', 'localtime');
 ```
 
-### Cleanup Process (cleanup.sh)
+### Session Cleanup
 
-Runs every 5 minutes via LaunchAgent:
-1. Query all running sessions: `SELECT id, pid FROM sessions WHERE status='running'`
-2. For each session: check if process exists with `kill -0 $pid 2>/dev/null`
-3. If process dead: mark as terminated and set end_time
-4. Check for sessions running >24h: mark as terminated
-5. Execute `VACUUM` to reclaim space from deleted records
+Sessions are marked as `completed` when Stop hook is triggered. Orphaned sessions (e.g., terminal closed unexpectedly) will remain as `running` in the database. Users can manually clean these using:
+```bash
+claude-query clean 30  # Clean sessions older than 30 days
+```
 
 ### File Structure
 
@@ -233,14 +231,14 @@ Project Root (development):
     └── query.sh          # CLI for stats/export/clean operations
 
 Runtime (~/.claude/):
-├── settings.json                   # Claude Code config (hooks added by install.sh, shared)
+├── settings.json                   # User-level Claude Code config (hooks added by install.sh)
+├── monitor.db                      # SQLite database (in parent directory for easy access)
 └── claude-code-helper/            # Our application directory (isolated, can be safely deleted)
-    ├── monitor.db                 # SQLite database (persistent)
     ├── scripts/                   # Copied from project during install
-    │   ├── init.sh
-    │   ├── record.sh
-    │   └── query.sh
-    ├── logs/                      # monitor.log, daemon.log, daemon_error.log
+    │   ├── init.sh               # Database initialization
+    │   ├── record.sh             # Hook event handler
+    │   └── query.sh              # CLI for stats/export/clean
+    ├── logs/                      # monitor.log
     └── backups/                   # Manual backup destination
 ```
 
@@ -248,23 +246,29 @@ Runtime (~/.claude/):
 
 ### Design Choices
 1. **SQLite over Files**: ACID guarantees, SQL queries, efficient indexing, <10ms query time
-2. **Shell Scripts over Python**: Minimal dependencies (bash, sqlite3, jq), fast startup (<50ms), easier distribution
+2. **Shell Scripts over Python**: Minimal dependencies (bash, sqlite3, terminal-notifier), fast startup (<50ms), easier distribution
 3. **Hook-Based Architecture**: Non-invasive, officially supported by Claude Code, event-driven
-4. **Dialog over Notification**: `display dialog` more reliable than `display notification` (survives sleep/wake)
+4. **terminal-notifier**: Required dependency for reliable native macOS notifications
 5. **Local-Only Storage**: Privacy-first, all data stays on user's machine
 6. **Session UUID Format**: `$(date +%s)-$$-$RANDOM` ensures uniqueness across terminals
-7. **Latest Session Strategy**: Assumes one active session per terminal, queries `ORDER BY id DESC LIMIT 1`
-8. **Directory Isolation Principle**: ⚠️ **CRITICAL** - Clean separation of concerns!
+7. **Latest Session Strategy**: Assumes one active session per Claude Code instance, matches by PPID
+8. **User-Level Hook Configuration Only**: ⚠️ **SIMPLIFIED ARCHITECTURE**
+   - **User-Level Only**: `~/.claude/settings.json` (applies to all sessions globally)
+   - **No Project-Level Scanning**: Removed complexity, relies on inheritance
+   - **Configuration Inheritance**: Projects automatically inherit user-level hooks
+   - **Benefits**: Simple, maintainable, no risk of conflicting with team configurations
+9. **Directory Isolation Principle**: ⚠️ **CRITICAL** - Clean separation of concerns!
    - **Application Directory**: `~/.claude/claude-code-helper/` (our exclusive space)
-     - Contains: `monitor.db`, `scripts/`, `logs/`, `backups/`
+     - Contains: `scripts/`, `logs/`, `backups/`
      - **Safe to delete entirely** on uninstall - no risk to other tools
      - Clear ownership and isolation
+   - **Database File**: `~/.claude/monitor.db` (in parent directory for easy access)
    - **Shared File**: `~/.claude/settings.json` (Claude Code official config)
      - **NEVER** delete this file - only modify the `hooks` field
      - Always backup before modification (with timestamp)
      - On uninstall: remove our hooks, preserve everything else
-   - **Uninstall Strategy**: Simply `rm -rf ~/.claude/claude-code-helper`
-   - **Benefits**: No conflicts, easy cleanup, clear boundaries
+   - **Uninstall Strategy**: Remove hooks from user settings, backup DB, then `rm -rf ~/.claude/claude-code-helper`
+   - **Benefits**: No conflicts, easy cleanup, clear boundaries, simple maintenance
 
 ### Performance Constraints
 - **Hook execution**: <50ms total (critical path)
@@ -305,7 +309,8 @@ The test suite validates:
 
 **Run tests before committing changes:**
 ```bash
-./test.sh  # Must pass 23/23 tests
+./test.sh  # Must pass all tests
+shellcheck scripts/*.sh install.sh uninstall.sh  # Lint shell scripts
 ```
 
 ### Manual Testing Scenarios
@@ -357,16 +362,19 @@ Edit `record.sh` lines 211-213 (Stop event notification):
 **Symptoms:** No sessions being recorded
 **Diagnosis:**
 ```bash
-# Check hooks config
+# Check user-level hooks config
 cat ~/.claude/settings.json | jq '.hooks'
 
 # Test hook manually
-echo '{"message":"test"}' | bash -x ~/.claude/scripts/record.sh start
+echo '{"message":"test"}' | bash -x ~/.claude/claude-code-helper/scripts/record.sh start
 
 # Check script permissions
-ls -l ~/.claude/scripts/*.sh
+ls -l ~/.claude/claude-code-helper/scripts/*.sh
+
+# Verify terminal-notifier is installed
+which terminal-notifier
 ```
-**Fix:** Re-run `./install.sh` or manually add hooks to settings.json
+**Fix:** Re-run `./install.sh` to configure hooks and install dependencies
 
 ### Issue: Database is locked
 **Symptoms:** `Error: database is locked` in logs
@@ -376,26 +384,19 @@ lsof ~/.claude/monitor.db
 ```
 **Fix:** Close open sqlite3 sessions, restart daemon
 
-### Issue: Daemon not running
-**Symptoms:** Orphaned sessions not cleaned up
+### Issue: Notifications not showing
+**Symptoms:** No notifications appear on Stop event
 **Diagnosis:**
 ```bash
-launchctl list | grep claude.monitor
-tail ~/.claude/logs/daemon_error.log
+# Test terminal-notifier directly
+terminal-notifier -title "Test" -message "Hello" -sound "Glass"
+
+# Check if terminal-notifier is installed
+which terminal-notifier
+
+# Check System Preferences → Notifications
 ```
 **Fix:**
-```bash
-launchctl unload ~/Library/LaunchAgents/com.claude.monitor.plist
-launchctl load ~/Library/LaunchAgents/com.claude.monitor.plist
-```
-
-### Issue: Notifications not showing
-**Symptoms:** No dialog appears on Stop event
-**Diagnosis:**
-```bash
-# Test osascript directly
-osascript -e 'display dialog "test"'
-
-# Check System Preferences → Notifications → Terminal
-```
-**Fix:** Enable notifications for Terminal.app in System Preferences
+- Install terminal-notifier: `brew install terminal-notifier`
+- Enable notifications for terminal-notifier in System Preferences
+- Restart Claude Code after enabling notifications

@@ -63,10 +63,32 @@ get_or_create_session() {
             "SELECT id FROM sessions WHERE session_uuid='$SESSION_ID_FROM_HOOK' LIMIT 1" 2>/dev/null || echo "")
     fi
 
-    # If not found, find running session
+    # If not found, find running session by parent PID (Claude Code main process)
+    # Use PPID because hooks run in child processes, but share the same parent
     if [ -z "$session_id" ]; then
         session_id=$(sqlite3 "$DB_PATH" \
-            "SELECT id FROM sessions WHERE status='running' ORDER BY id DESC LIMIT 1" 2>/dev/null || echo "")
+            "SELECT id FROM sessions WHERE status='running' AND pid=$PPID ORDER BY id DESC LIMIT 1" 2>/dev/null || echo "")
+
+        # Verify the process is still alive
+        if [ -n "$session_id" ]; then
+            local session_pid=$(sqlite3 "$DB_PATH" \
+                "SELECT pid FROM sessions WHERE id=$session_id" 2>/dev/null || echo "")
+
+            if [ -n "$session_pid" ]; then
+                # Check if process exists
+                if ! kill -0 "$session_pid" 2>/dev/null; then
+                    log "Found dead session $session_id (PID=$session_pid), marking as terminated"
+                    sqlite3 "$DB_PATH" << EOF
+UPDATE sessions
+SET status='terminated',
+    end_time=datetime('now'),
+    duration=CAST((julianday(datetime('now')) - julianday(start_time)) * 86400 AS INTEGER)
+WHERE id=$session_id;
+EOF
+                    session_id=""
+                fi
+            fi
+        fi
     fi
 
     if [ -z "$session_id" ]; then
@@ -86,11 +108,11 @@ get_or_create_session() {
 
         session_id=$(sqlite3 "$DB_PATH" << EOF
 INSERT INTO sessions (session_uuid, start_time, status, project_name, project_path, pid, terminal_session)
-VALUES ('$uuid', datetime('now'), 'running', '$project_name', '$project_path', $$, '$terminal_session');
+VALUES ('$uuid', datetime('now'), 'running', '$project_name', '$project_path', $PPID, '$terminal_session');
 SELECT last_insert_rowid();
 EOF
 )
-        log "Created new session: $session_id (PID: $$)"
+        log "Created new session: $session_id (PPID: $PPID)"
     else
         log "Found existing session: $session_id"
     fi
@@ -114,11 +136,22 @@ record_message() {
         # Escape single quotes
         content="${content//\'/\'\'}"
 
+        # Get project path from current directory
+        local project_path="$PWD"
+        project_path="${project_path//\'/\'\'}"
+
+        # Don't calculate interaction_duration here - it will be updated when Stop event occurs
         sqlite3 "$DB_PATH" << EOF
-INSERT INTO messages (session_id, message_type, content)
-VALUES ($session_id, 'user', '$content');
+INSERT INTO messages (session_id, message_type, content, interaction_duration, project_path)
+VALUES (
+    $session_id,
+    'user',
+    '$content',
+    NULL,
+    '$project_path'
+);
 EOF
-        log "Recorded message for session $session_id"
+        log "Recorded message for session $session_id (path: $project_path)"
     fi
 }
 
@@ -160,13 +193,8 @@ send_notification() {
     local message="$2"
     local sound="${3:-default}"
 
-    if command -v terminal-notifier &> /dev/null; then
-        terminal-notifier -title "$title" -message "$message" -sound "$sound" &
-        log "Notification sent: $title - $message"
-    else
-        log "WARNING: terminal-notifier not found, skipping notification"
-        log "Install with: brew install terminal-notifier"
-    fi
+    terminal-notifier -title "$title" -message "$message" -sound "$sound" &
+    log "Notification sent: $title - $message"
 }
 
 # Main event handling
@@ -218,14 +246,22 @@ case "$EVENT_TYPE" in
             log "Calculated duration from start_time (no prompt recorded): $DURATION seconds"
         fi
 
-        # Update session end time (但保留原有的 duration 计算方式用于统计总时长)
+        # Update session end time and durations
+        # duration: 会话总时长(从 start_time 到 now)
+        # last_interaction_duration: 单次对话时长(用于通知和统计)
         sqlite3 "$DB_PATH" << EOF
 UPDATE sessions
 SET
     end_time = datetime('now'),
     duration = CAST((julianday(datetime('now')) - julianday(start_time)) * 86400 AS INTEGER),
+    last_interaction_duration = $DURATION,
     status = 'completed'
 WHERE id = $SESSION_ID;
+
+-- Update the last message's interaction_duration with the actual duration
+UPDATE messages
+SET interaction_duration = $DURATION
+WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = $SESSION_ID);
 EOF
 
         # Get session info for notification
@@ -234,8 +270,9 @@ EOF
         # Get today's stats
         TODAY_COUNT=$(sqlite3 "$DB_PATH" \
             "SELECT COUNT(*) FROM sessions WHERE date(start_time) = date('now', 'localtime') AND status='completed'")
+        # 使用 last_interaction_duration 计算今日单次对话时长的平均值
         TODAY_AVG=$(sqlite3 "$DB_PATH" \
-            "SELECT COALESCE(AVG(duration), 0) FROM sessions WHERE date(start_time) = date('now', 'localtime') AND status='completed'")
+            "SELECT COALESCE(AVG(last_interaction_duration), 0) FROM sessions WHERE date(start_time) = date('now', 'localtime') AND status='completed' AND last_interaction_duration IS NOT NULL")
 
         # Format duration strings
         DURATION_STR=$(format_duration $DURATION)
@@ -319,14 +356,20 @@ EOF
                 "SELECT CAST((julianday(datetime('now')) - julianday('$LAST_PROMPT_TIME')) * 86400 AS INTEGER)")
             log "Calculated duration from last_prompt_time: $DURATION seconds"
 
-            # Update session
+            # Update session and last message's interaction_duration
             sqlite3 "$DB_PATH" << EOF
 UPDATE sessions
 SET
     end_time = datetime('now'),
     duration = CAST((julianday(datetime('now')) - julianday(start_time)) * 86400 AS INTEGER),
+    last_interaction_duration = $DURATION,
     status = 'completed'
 WHERE id = $SESSION_ID;
+
+-- Update the last message's interaction_duration with the actual duration
+UPDATE messages
+SET interaction_duration = $DURATION
+WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = $SESSION_ID);
 EOF
 
             # Get session info
